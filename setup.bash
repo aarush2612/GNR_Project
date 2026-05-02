@@ -26,6 +26,11 @@ echo "  WORKDIR resolved to: $WORKDIR"
 
 echo ""
 echo "===== [1/5] Cloning repository ====="
+
+if [ -d "GNR_Project_repo" ]; then
+    rm -rf GNR_Project_repo
+fi
+
 git clone "https://github.com/aarush2612/GNR_Project" GNR_Project_repo
 cp GNR_Project_repo/inference.py "$WORKDIR/inference.py"
 echo "  Copied inference.py → $WORKDIR/inference.py"
