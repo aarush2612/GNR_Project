@@ -6,48 +6,88 @@ from PIL import Image
 import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+# ─── CLI ────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("--test_dir", required=True, help="Absolute path to test directory")
 args = parser.parse_args()
 
 TEST_DIR   = Path(args.test_dir)
-OUTPUT_CSV = Path("submission.csv")
+OUTPUT_CSV = Path("submission.csv")   # written to current working directory
 
-# ─── Locate cached model ─────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).parent
-_snapshots = BASE_DIR / "models" / "models--google--gemma-4-E2B-it" / "snapshots"
-_snap_dirs = [d for d in _snapshots.iterdir() if d.is_dir()]
-if not _snap_dirs:
-    raise FileNotFoundError(f"No snapshot found in {_snapshots}")
-MODEL_PATH = str(_snap_dirs[0])
-print(f"Loading model from: {MODEL_PATH}")
+# ─── Locate model weights ────────────────────────────────────────────────────
+# model_weights/ sits next to inference.py in the grading working directory.
+# snapshot_download may lay files out as either:
+#   model_weights/config.json               (flat)
+#   model_weights/snapshots/<hash>/...      (snapshot layout)
+#   model_weights/models--xxx/snapshots/<hash>/...  (full cache layout)
+# The helper below finds whichever structure is actually present.
 
-# ─── Load model ──────────────────────────────────────────────────────────────
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def find_model_dir(base: Path) -> Path:
+    """Return the directory that directly contains config.json."""
+    # Case 1: flat — files are directly in base
+    if (base / "config.json").exists():
+        return base
 
-processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True)
+    # Case 2: base/snapshots/<single_hash>/
+    snapshots_dir = base / "snapshots"
+    if snapshots_dir.is_dir():
+        children = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+        if children:
+            return children[0]   # only one hash folder will exist
+
+    # Case 3: base/models--<name>/snapshots/<single_hash>/
+    for sub in base.iterdir():
+        if sub.is_dir() and "snapshots" in [d.name for d in sub.iterdir() if d.is_dir()]:
+            snap = sub / "snapshots"
+            children = [d for d in snap.iterdir() if d.is_dir()]
+            if children:
+                return children[0]
+
+    raise FileNotFoundError(
+        f"Cannot locate config.json anywhere under {base}. "
+        "Check that setup.bash completed successfully."
+    )
+
+BASE_WEIGHTS = Path(__file__).resolve().parent / "model_weights"
+
+if not BASE_WEIGHTS.exists():
+    raise FileNotFoundError(
+        f"model_weights/ not found at {BASE_WEIGHTS}. "
+        "Did setup.bash finish without errors?"
+    )
+
+MODEL_DIR = find_model_dir(BASE_WEIGHTS)
+print(f"Using model weights at: {MODEL_DIR}")
+
+# ─── Load model (fully offline) ──────────────────────────────────────────────
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = AutoProcessor.from_pretrained(str(MODEL_DIR))
 model = AutoModelForImageTextToText.from_pretrained(
-    MODEL_PATH,
+    str(MODEL_DIR),
     device_map="auto",
-    dtype=torch.bfloat16,
-    local_files_only=True,
+    torch_dtype=torch.bfloat16,
 )
 model.eval()
-print(f"Model loaded — CUDA available: {torch.cuda.is_available()}")
+print(f"Model loaded on {device}")
 
 # ─── Prompt ──────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are a deep learning expert. "
+    "You are a genius in the field of deep learning. "
     "Solve the MCQ question in the image. "
-    "Reason step by step inside <thought> tags. "
-    "After </thought>, output only a single letter: A, B, C, or D. "
-    "If unsure, output E. No punctuation, no explanation — just the letter."
+    "First, provide all of your reasoning inside <thought> tags. "
+    "After closing the thought tags, provide your final answer. "
+    "The final answer MUST be exactly one letter (A, B, C, or D) and nothing else. "
+    "Last letter should be the correct option, A, B, C or D. "
+    "Also if you are not confident about your answer, answer with E"
 )
 
-ANSWER_MAP = {"A": "1", "B": "2", "C": "3", "D": "4", "E": "5"}
-
 def get_answer(text: str) -> str:
+    """Extract the last single-letter answer from the model output."""
+    if "<turn|>" in text:
+        candidate = text.split("<turn|>")[0][-1].strip().upper()
+        if candidate in "ABCDE":
+            return candidate
     for ch in reversed(text.strip()):
         if ch.upper() in "ABCDE":
             return ch.upper()
@@ -55,22 +95,24 @@ def get_answer(text: str) -> str:
 
 def run_inference(image_path: Path) -> str:
     image = Image.open(image_path).convert("RGB")
+
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text",  "text": SYSTEM_PROMPT},
+                {"type": "text", "text": SYSTEM_PROMPT},
             ],
         }
     ]
+
     inputs = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-    ).to(DEVICE, dtype=torch.bfloat16)   # use DEVICE, not model.device (which is "meta" with device_map="auto")
+    ).to(model.device, dtype=torch.bfloat16)
 
     with torch.no_grad():
         output_ids = model.generate(**inputs, max_new_tokens=4096)
@@ -79,61 +121,30 @@ def run_inference(image_path: Path) -> str:
     generated = processor.decode(output_ids[0][input_len:], skip_special_tokens=True)
     return get_answer(generated)
 
-# ─── Read test.csv ────────────────────────────────────────────────────────────
-test_csv = TEST_DIR / "test.csv"
-if not test_csv.exists():
-    raise FileNotFoundError(f"test.csv not found in {TEST_DIR}")
+# ─── Collect images ──────────────────────────────────────────────────────────
+VALID_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+image_files = sorted([
+    f for f in TEST_DIR.iterdir()
+    if f.suffix.lower() in VALID_EXT
+])
 
-with open(test_csv, "r") as f:
-    image_names = [row["image_name"] for row in csv.DictReader(f)]
+if not image_files:
+    raise FileNotFoundError(f"No images found in {TEST_DIR}")
 
-print(f"Found {len(image_names)} images in test.csv")
+print(f"Found {len(image_files)} images in {TEST_DIR}")
 
-# ─── Pre-fill submission.csv with default 5 ──────────────────────────────────
-results = {name: "5" for name in image_names}
+# ─── Run and write CSV ───────────────────────────────────────────────────────
+results = []
+for idx, img_path in enumerate(image_files, 1):
+    start   = time.time()
+    answer  = run_inference(img_path)
+    elapsed = time.time() - start
+    print(f"[{idx}/{len(image_files)}] {img_path.name} → {answer}  ({elapsed:.1f}s)")
+    results.append({"image": img_path.name, "answer": answer})
 
-def save_csv():
-    with open(OUTPUT_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["image_name", "option"])
-        writer.writeheader()
-        for name in image_names:
-            writer.writerow({"image_name": name, "option": results[name]})
+with open(OUTPUT_CSV, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["image", "answer"])
+    writer.writeheader()
+    writer.writerows(results)
 
-save_csv()
-
-# ─── Inference loop ───────────────────────────────────────────────────────────
-VALID_EXT = [".png", ".jpg", ".jpeg", ".bmp", ".webp"]
-
-for idx, image_name in enumerate(image_names, 1):
-    image_path = None
-    for folder in ["images", "image", ""]:
-        img_dir = TEST_DIR / folder if folder else TEST_DIR
-        if not img_dir.exists():
-            continue
-        if (img_dir / image_name).exists():
-            image_path = img_dir / image_name
-            break
-        for ext in VALID_EXT:
-            if (img_dir / f"{image_name}{ext}").exists():
-                image_path = img_dir / f"{image_name}{ext}"
-                break
-        if image_path:
-            break
-
-    if image_path is None:
-        print(f"[{idx}/{len(image_names)}] WARNING: '{image_name}' not found — keeping 5")
-        continue
-
-    try:
-        t      = time.time()
-        letter = run_inference(image_path)
-        elapsed = time.time() - t
-        number = ANSWER_MAP.get(letter, "5")
-        results[image_name] = number
-        save_csv()
-        print(f"[{idx}/{len(image_names)}] {image_name} → {letter} ({number})  ({elapsed:.1f}s)")
-    except Exception as e:
-        print(f"[{idx}/{len(image_names)}] ERROR on {image_name}: {e} — keeping 5")
-        save_csv()
-
-print(f"\nDone! Predictions saved to {OUTPUT_CSV}")
+print(f"\nDone! Saved {len(results)} predictions to {OUTPUT_CSV}")
