@@ -9,18 +9,17 @@ elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
 elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
     source "$HOME/anaconda3/etc/profile.d/conda.sh"
 else
-    echo "ERROR: Could not find conda.sh."
+    echo "ERROR: Could not find conda.sh. Please check your conda installation."
     exit 1
 fi
 
 ENV_NAME="gnr_project_env"
 PYTHON_VERSION="3.11"
-WORK_DIR="$(pwd)"
 
 echo ""
 echo "===== [1/5] Cloning repository ====="
 git clone "https://github.com/aarush2612/GNR_Project"
-cp GNR_Project/inference.py "$WORK_DIR/inference.py"
+cd "GNR_Project"
 
 echo ""
 echo "===== [2/5] Creating conda environment (Python 3.11) ====="
@@ -45,31 +44,29 @@ conda run -n "$ENV_NAME" python -m pip install \
     -v 2>&1 | grep -E "Downloading|Installing|Successfully|error|Error" || true
 
 echo ""
-echo "===== [4/5] Downloading Gemma-4 model weights ====="
-conda run -n "$ENV_NAME" --no-capture-output python - <<EOF
-from transformers import AutoProcessor, AutoModelForImageTextToText
-import huggingface_hub
+echo "===== [4/5] Downloading Gemma-4 model weights INTO ./model_weights ====="
+echo "  This will take 10-20 minutes depending on your internet speed..."
 
-huggingface_hub.utils.logging.set_verbosity_info()
+conda run -n "$ENV_NAME" --no-capture-output python - <<'EOF'
+from huggingface_hub import snapshot_download
+import os
 
 model_name = "google/gemma-4-E2B-it"
-cache_dir = "$WORK_DIR/models"
+local_dir  = os.path.join(os.getcwd(), "model_weights")   # <── saves HERE, not in ~/.cache
 
-print(f"Downloading processor for {model_name}...")
-processor = AutoProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-print("Processor done.")
-
-print(f"Downloading model weights for {model_name}...")
-model = AutoModelForImageTextToText.from_pretrained(
-    model_name,
-    device_map="auto",
-    dtype="bfloat16",
-    cache_dir=cache_dir,
+print(f"\nDownloading {model_name} → {local_dir}")
+snapshot_download(
+    repo_id=model_name,
+    local_dir=local_dir,
+    local_dir_use_symlinks=False,   # real files, no symlinks into cache
+    ignore_patterns=["*.gguf"],
 )
-print("Model downloaded and cached successfully!")
+print(f"\nAll weights saved to: {local_dir}")
 EOF
 
 echo ""
 echo "===== [5/5] Setup complete! ====="
+echo ""
+echo "Next steps:"
 echo "  conda activate gnr_project_env"
 echo "  python inference.py --test_dir <absolute_path_to_test_dir>"
