@@ -15,16 +15,19 @@ fi
 
 ENV_NAME="gnr_project_env"
 PYTHON_VERSION="3.11"
+WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Remember the grading working directory — inference.py must live HERE
-WORKDIR="$(pwd)"
+# ─── On Git Bash / MSYS2, convert /c/Users/... → C:/Users/... ───────────────
+if command -v cygpath &> /dev/null; then
+    WORKDIR="$(cygpath -w "$WORKDIR")"
+fi
+
+echo "  WORKDIR resolved to: $WORKDIR"
 
 echo ""
 echo "===== [1/5] Cloning repository ====="
-git clone "https://github.com/aarush2612/GNR_Project"
-
-# Copy inference.py from the repo INTO the grading working directory
-cp GNR_Project/inference.py "$WORKDIR/inference.py"
+git clone "https://github.com/aarush2612/GNR_Project" GNR_Project_repo
+cp GNR_Project_repo/inference.py "$WORKDIR/inference.py"
 echo "  Copied inference.py → $WORKDIR/inference.py"
 
 echo ""
@@ -33,41 +36,46 @@ conda create -y -n "$ENV_NAME" python="$PYTHON_VERSION"
 
 echo ""
 echo "===== [3/5] Installing dependencies ====="
-echo "  [3a] Upgrading pip..."
 conda run -n "$ENV_NAME" python -m pip install --upgrade pip -q
 
-echo "  [3b] Installing PyTorch with CUDA 12.6..."
+echo "  Installing PyTorch with CUDA 12.6..."
 conda run -n "$ENV_NAME" python -m pip install \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu126 \
     --no-cache-dir \
     -v 2>&1 | grep -E "Downloading|Installing|Successfully|error|Error" || true
 
-echo "  [3c] Installing transformers and other packages..."
+echo "  Installing transformers, kagglehub and other packages..."
 conda run -n "$ENV_NAME" python -m pip install \
-    "transformers>=4.51.0" accelerate pillow pandas tqdm huggingface_hub \
+    "transformers>=4.51.0" accelerate pillow pandas tqdm kagglehub \
     --no-cache-dir \
     -v 2>&1 | grep -E "Downloading|Installing|Successfully|error|Error" || true
 
 echo ""
-echo "===== [4/5] Downloading Gemma-4 model weights → $WORKDIR/model_weights ====="
+echo "===== [4/5] Downloading Gemma-4-E2B-IT → $WORKDIR/model_weights ====="
 
-# Run from WORKDIR so model_weights/ lands next to inference.py
 conda run -n "$ENV_NAME" --no-capture-output python - <<EOF
-from huggingface_hub import snapshot_download
+import kagglehub
 import os
+import shutil
 
-model_name = "google/gemma-4-E2B-it"
-local_dir  = os.path.join("$WORKDIR", "model_weights")
+os.environ["KAGGLE_USERNAME"] = "aarushtripathi01"
+os.environ["KAGGLE_KEY"]      = "KGAT_c13aaaec8263a31709cb90b9ff96444a"
 
-print(f"Downloading {model_name} into {local_dir} ...")
-snapshot_download(
-    repo_id=model_name,
-    local_dir=local_dir,
-    local_dir_use_symlinks=False,
-    ignore_patterns=["*.gguf"],
+dest = os.path.join(r"$WORKDIR", "model_weights")
+
+# Remove existing dir so output_dir receives a clean empty directory
+if os.path.exists(dest):
+    print(f"Removing existing directory: {dest}")
+    shutil.rmtree(dest)
+os.makedirs(dest, exist_ok=True)
+
+print(f"Downloading to: {dest}")
+downloaded_path = kagglehub.model_download(
+    "google/gemma-4/transformers/gemma-4-e2b-it",
+    output_dir=dest
 )
-print(f"Done. Weights saved to: {local_dir}")
+print(f"Model weights downloaded directly to: {downloaded_path}")
 EOF
 
 echo ""
@@ -75,6 +83,6 @@ echo "===== [5/5] Setup complete! ====="
 echo "  inference.py  → $WORKDIR/inference.py"
 echo "  model_weights → $WORKDIR/model_weights"
 echo ""
-echo "Next steps:"
+echo "Grader will now run:"
 echo "  conda activate gnr_project_env"
 echo "  python inference.py --test_dir <absolute_path_to_test_dir>"
