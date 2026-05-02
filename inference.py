@@ -21,6 +21,8 @@ MODEL_PATH = BASE_DIR / "model_weights"
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"model_weights directory not found at: {MODEL_PATH}")
+else:
+    print(f"Model weights directory found at: {MODEL_PATH}")
 
 def find_model_root(base: Path) -> Path:
     if (base / "config.json").exists():
@@ -36,44 +38,41 @@ def find_model_root(base: Path) -> Path:
 MODEL_PATH = find_model_root(MODEL_PATH)
 print(f"Loading model from: {MODEL_PATH}")
 
-# ─── VRAM check ──────────────────────────────────────────────────────────────
-VRAM_THRESHOLD_GB = 8.0
-
-def get_vram_gb() -> float:
-    if not torch.cuda.is_available():
-        return 0.0
-    return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-
-vram_gb  = get_vram_gb()
-USE_GPU  = torch.cuda.is_available() and vram_gb >= VRAM_THRESHOLD_GB
-
-if not torch.cuda.is_available():
-    print("CUDA not available — using CPU")
-elif USE_GPU:
-    print(f"VRAM detected: {vram_gb:.1f} GB (>= {VRAM_THRESHOLD_GB} GB) — using GPU")
+# ─── Device setup ────────────────────────────────────────────────────────────
+if torch.cuda.is_available():
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM: {vram_gb:.1f} GB")
+    if vram_gb >= 8:
+        DEVICE = torch.device("cuda:0")
+        print("VRAM sufficient — using GPU (cuda:0)")
+    else:
+        DEVICE = torch.device("cpu")
+        print(f"VRAM too low ({vram_gb:.1f} GB < 8 GB) — falling back to CPU")
 else:
-    print(f"VRAM detected: {vram_gb:.1f} GB (< {VRAM_THRESHOLD_GB} GB) — falling back to CPU")
-
-DEVICE      = torch.device("cuda:0" if USE_GPU else "cpu")
-DEVICE_MAP  = "auto" if USE_GPU else "cpu"
-OFFLOAD_DIR = BASE_DIR / "offload"
-OFFLOAD_DIR.mkdir(exist_ok=True)
+    DEVICE = torch.device("cpu")
+    print("CUDA not available — using CPU")
 
 # ─── Load model ──────────────────────────────────────────────────────────────
 print("Loading processor...")
-processor = AutoProcessor.from_pretrained(str(MODEL_PATH), local_files_only=True)
+processor = AutoProcessor.from_pretrained(
+    str(MODEL_PATH),
+    local_files_only=True,
+    padding_side="left",
+)
 
 print("Loading model...")
 model = AutoModelForImageTextToText.from_pretrained(
     str(MODEL_PATH),
-    device_map=DEVICE_MAP,
     dtype=torch.bfloat16,
     local_files_only=True,
-    offload_folder=str(OFFLOAD_DIR),
-    offload_buffers=True,
-)
+).to(DEVICE)
 model.eval()
-print(f"Model loaded | device_map={DEVICE_MAP} | VRAM={vram_gb:.1f} GB")
+
+print(f"Model loaded on: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"VRAM used: {torch.cuda.memory_allocated(0) / 1024**3:.1f} GB")
+    print(f"VRAM free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3:.1f} GB")
 
 # ─── Prompt ──────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
@@ -109,9 +108,7 @@ def run_inference(image_path: Path) -> str:
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-    )
-    inputs = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-              for k, v in inputs.items()}
+    ).to(DEVICE)
 
     with torch.no_grad():
         output_ids = model.generate(**inputs, max_new_tokens=4096)
@@ -121,24 +118,18 @@ def run_inference(image_path: Path) -> str:
     return get_answer(generated)
 
 # ─── Read test.csv ────────────────────────────────────────────────────────────
-# Expected columns: image_id, image_name  (per competition description)
 test_csv = TEST_DIR / "test.csv"
 if not test_csv.exists():
     raise FileNotFoundError(f"test.csv not found in {TEST_DIR}")
 
 with open(test_csv, "r") as f:
-    reader = csv.DictReader(f)
-    rows = list(reader)
+    rows = list(csv.DictReader(f))
 
-# Support both column naming conventions defensively
 image_names = [row.get("image_name") or row.get("image_id") for row in rows]
-image_names = [n for n in image_names if n]  # drop any None
-
+image_names = [n for n in image_names if n]
 print(f"Found {len(image_names)} images in test.csv")
 
 # ─── Image lookup ─────────────────────────────────────────────────────────────
-# Per competition spec, images are in: <test_dir>/image/<image_name>.png
-# We search: image/ (spec), images/ (fallback), root (fallback)
 SEARCH_FOLDERS = ["image", "images", ""]
 VALID_EXT      = [".png", ".jpg", ".jpeg", ".bmp", ".webp"]
 
@@ -147,34 +138,26 @@ def find_image(image_name: str) -> Path | None:
         img_dir = TEST_DIR / folder if folder else TEST_DIR
         if not img_dir.exists():
             continue
-        # Exact match first
         if (img_dir / image_name).exists():
             return img_dir / image_name
-        # Try appending extensions
         for ext in VALID_EXT:
-            candidate = img_dir / f"{image_name}{ext}"
-            if candidate.exists():
-                return candidate
+            if (img_dir / f"{image_name}{ext}").exists():
+                return img_dir / f"{image_name}{ext}"
     return None
 
-# ─── submission.csv format ───────────────────────────────────────────────────
-# Required: id, image_name, option   (id == image_name per competition spec)
-results = {name: "5" for name in image_names}  # default = unanswered
+# ─── submission.csv ───────────────────────────────────────────────────────────
+results = {name: "5" for name in image_names}
 
 def save_csv():
     with open(OUTPUT_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["id", "image_name", "option"])
         writer.writeheader()
         for name in image_names:
-            writer.writerow({
-                "id":         name,
-                "image_name": name,
-                "option":     results[name],
-            })
+            writer.writerow({"id": name, "image_name": name, "option": results[name]})
 
-save_csv()  # write defaults immediately so partial results are always on disk
+save_csv()
 
-# ─── Inference loop with progress bar ────────────────────────────────────────
+# ─── Inference loop ───────────────────────────────────────────────────────────
 total_start = time.time()
 timings     = []
 
@@ -198,15 +181,8 @@ for image_name in pbar:
         save_csv()
 
         avg = sum(timings) / len(timings)
-        pbar.set_postfix({
-            "last": f"{elapsed:.1f}s",
-            "avg":  f"{avg:.1f}s",
-            "ans":  f"{letter}({number})",
-        })
-        pbar.write(
-            f"  [{image_name}] → {letter} ({number})  "
-            f"time={elapsed:.1f}s  avg={avg:.1f}s"
-        )
+        pbar.set_postfix({"last": f"{elapsed:.1f}s", "avg": f"{avg:.1f}s", "ans": f"{letter}({number})"})
+        pbar.write(f"  [{image_name}] → {letter} ({number})  time={elapsed:.1f}s  avg={avg:.1f}s")
 
     except Exception as e:
         pbar.write(f"  ERROR on '{image_name}': {e} — keeping 5")
@@ -215,6 +191,6 @@ for image_name in pbar:
 total_elapsed = time.time() - total_start
 print(f"\n{'='*60}")
 print(f"Done! {len(image_names)} images processed in {total_elapsed:.1f}s")
-print(f"Avg per image : {(total_elapsed/len(image_names)):.1f}s" if image_names else "")
+print(f"Avg per image: {(total_elapsed / len(image_names)):.1f}s" if image_names else "")
 print(f"Predictions saved to: {OUTPUT_CSV}")
 print(f"{'='*60}")
